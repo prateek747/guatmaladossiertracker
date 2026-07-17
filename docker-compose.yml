@@ -1,0 +1,22 @@
+services:
+  siad-lookup:
+    build: .
+    container_name: siad-lookup-service
+    restart: always
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./screenshots:/app/screenshots
+    environment:
+      - PORT=5001
+      - SCREENSHOT_DIR=/app/screenshots
+
+    # If n8n runs in Docker on a shared network, uncomment and set the
+    # network name so n8n can reach this service by container name
+    # (http://siad-lookup-service:5001) instead of localhost:
+    # networks:
+    #   - n8n-network
+
+# networks:
+#   n8n-network:
+#     external: true
