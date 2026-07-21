@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
 SIAD Dossier Lookup Service
-- Looks up a dossier on the Guatemala MSPAS SIAD site using a real headless browser
-- Fills in the SIAD No. and query key, submits, reads back the result
+- Looks up a dossier on the Guatemala MSPAS SIAD site
+- Uses direct HTTP requests (ASP.NET VIEWSTATE handshake) to reliably fetch
+  the result page -- this avoids timing races that occur when driving a
+  live browser against this particular (fairly slow) government site
 - Extracts all header fields + the current status (latest movement's ESTADO)
-- Saves + returns a full-page screenshot of the result
-- Exposes a simple Flask API (/health, /lookup) so n8n (or anything else) can call it
+- Renders the fetched HTML in a headless browser purely to capture a
+  full-page screenshot (no live navigation/timing issues, since the HTML
+  is already final)
+- Exposes a simple Flask API (/health, /lookup) so n8n (or anything else)
+  can call it
 """
 
-import asyncio
 import base64
 import os
 import re
+import requests
 from flask import Flask, request, jsonify
-from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 
 # ===================== CONFIG =====================
 PORT = int(os.environ.get("PORT", 5001))
@@ -68,63 +73,74 @@ def extract_current_status(html):
     }
 
 
-class SiadLookup:
-    async def __aenter__(self):
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-        self.page = await self.browser.new_page()
-        return self
+def get_viewstate_tokens():
+    """GET the form page and extract the ASP.NET VIEWSTATE handshake fields + session cookie."""
+    resp = requests.get(SIAD_URL, timeout=30)
+    html = resp.text
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.browser.close()
-        await self.playwright.stop()
+    def get_val(field_id):
+        m = re.search(r'id="' + field_id + r'"\s+value="([^"]*)"', html)
+        return m.group(1) if m else ""
 
-    async def lookup(self, siad_id, query_key):
-        await self.page.goto(SIAD_URL, wait_until="networkidle", timeout=30000)
-
-        await self.page.fill('input[name="TextBox1"]', str(siad_id))
-        await self.page.fill('input[name="txtLlaveConsulta"]', str(query_key))
-        await self.page.click('input[name="Button1"]')
-
-        # Wait specifically for either the results table or the form to
-        # reappear (invalid credentials case) rather than trusting generic
-        # network-idle, which can resolve before the results have rendered.
-        try:
-            await self.page.wait_for_selector(
-                'text=EXPEDIENTE', timeout=20000
-            )
-        except Exception:
-            # Fall back to a short extra wait in case the page is just slow;
-            # we still proceed to read whatever content is there.
-            await self.page.wait_for_timeout(3000)
-
-        html = await self.page.content()
-        screenshot_bytes = await self.page.screenshot(full_page=True)
-
-        fields = {key: extract_field(html, label) for key, label in FIELD_LABELS}
-        movement = extract_current_status(html)
-        found = bool(fields.get("expediente"))
-
-        screenshot_path = os.path.join(SCREENSHOT_DIR, f"{siad_id}.png")
-        with open(screenshot_path, "wb") as f:
-            f.write(screenshot_bytes)
-
-        return {
-            "success": True,
-            "found": found,
-            "fields": fields,
-            "currentStatus": movement["status"] if movement else None,
-            "lastMovement": movement,
-            "screenshotPath": screenshot_path,
-            "screenshotBase64": base64.b64encode(screenshot_bytes).decode("utf-8"),
-        }
+    return {
+        "viewstate": get_val("__VIEWSTATE"),
+        "viewstategenerator": get_val("__VIEWSTATEGENERATOR"),
+        "eventvalidation": get_val("__EVENTVALIDATION"),
+        "cookies": resp.cookies,
+    }
 
 
-async def run_lookup(siad_id, query_key):
-    async with SiadLookup() as lookup:
-        return await lookup.lookup(siad_id, query_key)
+def fetch_result_html(siad_id, query_key):
+    """Reliably fetch the SIAD result page HTML via direct HTTP POST (no browser)."""
+    tokens = get_viewstate_tokens()
+    payload = {
+        "__VIEWSTATE": tokens["viewstate"],
+        "__VIEWSTATEGENERATOR": tokens["viewstategenerator"],
+        "__EVENTVALIDATION": tokens["eventvalidation"],
+        "TextBox1": str(siad_id),
+        "txtLlaveConsulta": str(query_key),
+        "Button1": "Enviar",
+    }
+    resp = requests.post(
+        SIAD_URL, data=payload, cookies=tokens["cookies"], timeout=30
+    )
+    return resp.text
+
+
+def render_screenshot(html, siad_id):
+    """Render already-fetched HTML in a headless browser purely to screenshot it."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+        page = browser.new_page()
+        page.set_content(html, wait_until="load")
+        screenshot_bytes = page.screenshot(full_page=True)
+        browser.close()
+
+    screenshot_path = os.path.join(SCREENSHOT_DIR, f"{siad_id}.png")
+    with open(screenshot_path, "wb") as f:
+        f.write(screenshot_bytes)
+
+    return screenshot_bytes, screenshot_path
+
+
+def run_lookup(siad_id, query_key):
+    html = fetch_result_html(siad_id, query_key)
+
+    fields = {key: extract_field(html, label) for key, label in FIELD_LABELS}
+    movement = extract_current_status(html)
+    found = bool(fields.get("expediente"))
+
+    screenshot_bytes, screenshot_path = render_screenshot(html, siad_id)
+
+    return {
+        "success": True,
+        "found": found,
+        "fields": fields,
+        "currentStatus": movement["status"] if movement else None,
+        "lastMovement": movement,
+        "screenshotPath": screenshot_path,
+        "screenshotBase64": base64.b64encode(screenshot_bytes).decode("utf-8"),
+    }
 
 
 @app.route("/health", methods=["GET"])
@@ -143,11 +159,7 @@ def lookup_endpoint():
         query_key = str(data["key"]).strip()
         print(f"\nLooking up SIAD ID: {siad_id}")
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(run_lookup(siad_id, query_key))
-        loop.close()
-
+        result = run_lookup(siad_id, query_key)
         return jsonify(result), 200
 
     except Exception as e:
