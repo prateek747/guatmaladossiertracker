@@ -86,11 +86,19 @@ class SiadLookup:
 
         await self.page.fill('input[name="TextBox1"]', str(siad_id))
         await self.page.fill('input[name="txtLlaveConsulta"]', str(query_key))
+        await self.page.click('input[name="Button1"]')
 
-        await asyncio.gather(
-            self.page.wait_for_load_state("networkidle", timeout=30000),
-            self.page.click('input[name="Button1"]'),
-        )
+        # Wait specifically for either the results table or the form to
+        # reappear (invalid credentials case) rather than trusting generic
+        # network-idle, which can resolve before the results have rendered.
+        try:
+            await self.page.wait_for_selector(
+                'text=EXPEDIENTE', timeout=20000
+            )
+        except Exception:
+            # Fall back to a short extra wait in case the page is just slow;
+            # we still proceed to read whatever content is there.
+            await self.page.wait_for_timeout(3000)
 
         html = await self.page.content()
         screenshot_bytes = await self.page.screenshot(full_page=True)
