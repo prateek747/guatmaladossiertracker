@@ -6,6 +6,8 @@ SIAD Dossier Lookup Service
   the result page -- this avoids timing races that occur when driving a
   live browser against this particular (fairly slow) government site
 - Extracts all header fields + the current status (latest movement's ESTADO)
+- Also extracts the FULL movement history table (every row, top to bottom),
+  not just the most recent one
 - Renders the fetched HTML in a headless browser purely to capture a
   full-page screenshot (no live navigation/timing issues, since the HTML
   is already final)
@@ -45,6 +47,14 @@ FIELD_LABELS = [
     ("fechaUltimoMovimiento", "FECHA ULTIMO MOVIMIENTO"),
 ]
 
+# Regex for one row of the "DETALLE DE MOVIMIENTOS DEL EXPEDIENTE" table.
+# Columns, in order: NO | FECHA | ACTUAL | FOLIOS | OBSERVACIONES | MARGINADO | ENVIADO | ESTADO
+MOVEMENT_ROW_PATTERN = (
+    r"<tr>\s*<td>\s*<span[^>]*>(\d+)</span>\s*</td>"
+    r"<td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td>"
+    r"<td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td>\s*</tr>"
+)
+
 
 def extract_field(html, label):
     pattern = r"<strong>\s*" + label + r"\s*:?\s*</strong>\s*<span[^>]*>([^<]*)</span>"
@@ -53,12 +63,9 @@ def extract_field(html, label):
 
 
 def extract_current_status(html):
-    row_pattern = (
-        r"<tr>\s*<td>\s*<span[^>]*>(\d+)</span>\s*</td>"
-        r"<td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td>"
-        r"<td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td>\s*</tr>"
-    )
-    rows = re.findall(row_pattern, html)
+    """Kept exactly as before, for backward compatibility -- returns only
+    the most recent movement row, in the original shape."""
+    rows = re.findall(MOVEMENT_ROW_PATTERN, html)
     if not rows:
         return None
     first = rows[0]
@@ -68,6 +75,26 @@ def extract_current_status(html):
         "from": first[5].strip(),
         "to": first[2].strip(),
     }
+
+
+def extract_all_movements(html):
+    """New: returns EVERY row of the movement history table, top to
+    bottom, in the order they appear on the page (most recent first,
+    matching the site's own display order)."""
+    rows = re.findall(MOVEMENT_ROW_PATTERN, html)
+    movements = []
+    for r in rows:
+        movements.append({
+            "no": r[0].strip(),
+            "fecha": r[1].strip(),
+            "actual": r[2].strip(),
+            "folios": r[3].strip(),
+            "observaciones": r[4].strip(),
+            "marginado": r[5].strip(),
+            "enviado": r[6].strip(),
+            "estado": r[7].strip(),
+        })
+    return movements
 
 
 def get_viewstate_tokens():
@@ -122,6 +149,7 @@ def run_lookup(siad_id, query_key):
 
     fields = {key: extract_field(html, label) for key, label in FIELD_LABELS}
     movement = extract_current_status(html)
+    all_movements = extract_all_movements(html)
     found = bool(fields.get("expediente"))
 
     screenshot_bytes, screenshot_path = render_screenshot(html, siad_id)
@@ -132,6 +160,7 @@ def run_lookup(siad_id, query_key):
         "fields": fields,
         "currentStatus": movement["status"] if movement else None,
         "lastMovement": movement,
+        "allMovements": all_movements,
         "screenshotPath": screenshot_path,
         "screenshotBase64": base64.b64encode(screenshot_bytes).decode("utf-8"),
     }
