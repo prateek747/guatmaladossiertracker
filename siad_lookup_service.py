@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-SIAD Dossier Lookup Service (v2 -- real browser typing, raw output only)
-
-- Receives HA ID/Password and NL ID/Password in one request
-- For EACH of them (HA first, then NL):
-    1. Opens a real headless browser
-    2. Navigates to https://siadreg.mspas.gob.gt/consulta/
-    3. Types the ID into "Ingrese SIAD No." and the password into
-       "Ingrese llave de consulta." (exactly like a human would)
-    4. Clicks "Enviar"
-    5. Waits until the actual results table has rendered (not just "page
-       loaded" -- this site is slow, and grabbing the page too early
-       returns the still-blank form)
-    6. Captures the FULL resulting page as raw HTML (no parsing --
-       that's done downstream in n8n)
-    7. Also takes a full-page screenshot
-- Returns both HA and NL results together in one response, as raw
-  HTML + screenshot only.
+SIAD Dossier Lookup Service
+- Looks up a dossier on the Guatemala MSPAS SIAD site
+- Uses direct HTTP requests (ASP.NET VIEWSTATE handshake) to reliably fetch
+  the result page -- this avoids timing races that occur when driving a
+  live browser against this particular (fairly slow) government site
+- Extracts all header fields + the current status (latest movement's ESTADO)
+- Renders the fetched HTML in a headless browser purely to capture a
+  full-page screenshot (no live navigation/timing issues, since the HTML
+  is already final)
+- Exposes a simple Flask API (/health, /lookup) so n8n (or anything else)
+  can call it
 """
 
 import base64
 import os
+import re
+import requests
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
@@ -28,58 +24,117 @@ from playwright.sync_api import sync_playwright
 PORT = int(os.environ.get("PORT", 5001))
 SIAD_URL = "https://siadreg.mspas.gob.gt/consulta/"
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", "/app/screenshots")
-NAV_TIMEOUT_MS = 30000
-RESULTS_WAIT_TIMEOUT_MS = 20000
 # ==================================================
 
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 app = Flask(__name__)
 
+FIELD_LABELS = [
+    ("expediente", "EXPEDIENTE"),
+    ("documento", "DOCUMENTO DE REFERENCIA"),
+    ("fechaDocumento", "FECHA DE DOCUMENTO"),
+    ("asunto", "ASUNTO"),
+    ("unidadAdministrativa", "UNIDAD ADMINISTRATIVA"),
+    ("entidad", "ENTIDAD"),
+    ("marginado", "MARGINADO"),
+    ("descripcion", "DESCRIPCION"),
+    ("folios", "FOLIOS"),
+    ("remitente", "REMITENTE"),
+    ("observaciones", "OBSERVACIONES"),
+    ("fechaCreacion", "FECHA CREACION"),
+    ("fechaUltimoMovimiento", "FECHA ULTIMO MOVIMIENTO"),
+]
 
-def scrape_one(page, siad_id, query_key, label):
-    """Type the given ID/key into the live form, submit, wait for real
-    results, and return the full raw HTML + screenshot. No parsing."""
 
-    page.goto(SIAD_URL, wait_until="load", timeout=NAV_TIMEOUT_MS)
+def extract_field(html, label):
+    pattern = r"<strong>\s*" + label + r"\s*:?\s*</strong>\s*<span[^>]*>([^<]*)</span>"
+    m = re.search(pattern, html, re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
-    page.fill('input[name="TextBox1"]', "")
-    page.fill('input[name="TextBox1"]', str(siad_id))
-    page.fill('input[name="txtLlaveConsulta"]', "")
-    page.fill('input[name="txtLlaveConsulta"]', str(query_key))
 
-    page.click('input[name="Button1"]')
-
-    try:
-        page.wait_for_selector("text=EXPEDIENTE", timeout=RESULTS_WAIT_TIMEOUT_MS)
-    except Exception:
-        page.wait_for_timeout(3000)
-
-    html = page.content()
-    screenshot_bytes = page.screenshot(full_page=True)
-
-    screenshot_path = os.path.join(SCREENSHOT_DIR, f"{label}_{siad_id}.png")
-    with open(screenshot_path, "wb") as f:
-        f.write(screenshot_bytes)
-
+def extract_current_status(html):
+    row_pattern = (
+        r"<tr>\s*<td>\s*<span[^>]*>(\d+)</span>\s*</td>"
+        r"<td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td>"
+        r"<td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td>\s*</tr>"
+    )
+    rows = re.findall(row_pattern, html)
+    if not rows:
+        return None
+    first = rows[0]
     return {
-        "success": True,
-        "html": html,
-        "screenshotPath": screenshot_path,
-        "screenshotBase64": base64.b64encode(screenshot_bytes).decode("utf-8"),
+        "status": first[7].strip(),
+        "lastMovementDate": first[1].strip(),
+        "from": first[5].strip(),
+        "to": first[2].strip(),
     }
 
 
-def run_lookup(ha_id, ha_key, nl_id, nl_key):
+def get_viewstate_tokens():
+    resp = requests.get(SIAD_URL, timeout=30)
+    html = resp.text
+
+    def get_val(field_id):
+        m = re.search(r'id="' + field_id + r'"\s+value="([^"]*)"', html)
+        return m.group(1) if m else ""
+
+    return {
+        "viewstate": get_val("__VIEWSTATE"),
+        "viewstategenerator": get_val("__VIEWSTATEGENERATOR"),
+        "eventvalidation": get_val("__EVENTVALIDATION"),
+        "cookies": resp.cookies,
+    }
+
+
+def fetch_result_html(siad_id, query_key):
+    tokens = get_viewstate_tokens()
+    payload = {
+        "__VIEWSTATE": tokens["viewstate"],
+        "__VIEWSTATEGENERATOR": tokens["viewstategenerator"],
+        "__EVENTVALIDATION": tokens["eventvalidation"],
+        "TextBox1": str(siad_id),
+        "txtLlaveConsulta": str(query_key),
+        "Button1": "Enviar",
+    }
+    resp = requests.post(
+        SIAD_URL, data=payload, cookies=tokens["cookies"], timeout=30
+    )
+    return resp.text
+
+
+def render_screenshot(html, siad_id):
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
         page = browser.new_page()
-
-        ha_result = scrape_one(page, ha_id, ha_key, "ha")
-        nl_result = scrape_one(page, nl_id, nl_key, "nl")
-
+        page.set_content(html, wait_until="load")
+        screenshot_bytes = page.screenshot(full_page=True)
         browser.close()
 
-    return {"ha": ha_result, "nl": nl_result}
+    screenshot_path = os.path.join(SCREENSHOT_DIR, f"{siad_id}.png")
+    with open(screenshot_path, "wb") as f:
+        f.write(screenshot_bytes)
+
+    return screenshot_bytes, screenshot_path
+
+
+def run_lookup(siad_id, query_key):
+    html = fetch_result_html(siad_id, query_key)
+
+    fields = {key: extract_field(html, label) for key, label in FIELD_LABELS}
+    movement = extract_current_status(html)
+    found = bool(fields.get("expediente"))
+
+    screenshot_bytes, screenshot_path = render_screenshot(html, siad_id)
+
+    return {
+        "success": True,
+        "found": found,
+        "fields": fields,
+        "currentStatus": movement["status"] if movement else None,
+        "lastMovement": movement,
+        "screenshotPath": screenshot_path,
+        "screenshotBase64": base64.b64encode(screenshot_bytes).decode("utf-8"),
+    }
 
 
 @app.route("/health", methods=["GET"])
@@ -89,8 +144,6 @@ def health():
 
 @app.route("/lookup", methods=["POST"])
 def lookup_endpoint():
-    """Original single-lookup endpoint, kept for backward compatibility.
-    Body: {"id": "...", "key": "..."}"""
     try:
         data = request.get_json()
         if not data or "id" not in data or "key" not in data:
@@ -100,41 +153,7 @@ def lookup_endpoint():
         query_key = str(data["key"]).strip()
         print(f"\nLooking up SIAD ID: {siad_id}")
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = browser.new_page()
-            result = scrape_one(page, siad_id, query_key, "single")
-            browser.close()
-
-        return jsonify(result), 200
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/lookup-both", methods=["POST"])
-def lookup_both_endpoint():
-    """New combined endpoint: does HA first, then NL, in one browser session.
-    Body: {"haId": "...", "haKey": "...", "nlId": "...", "nlKey": "..."}
-    Returns raw HTML + screenshot for each -- no field parsing."""
-    try:
-        data = request.get_json()
-        required = ["haId", "haKey", "nlId", "nlKey"]
-        if not data or any(k not in data for k in required):
-            return jsonify({
-                "success": False,
-                "error": f"All of {required} are required"
-            }), 400
-
-        ha_id = str(data["haId"]).strip()
-        ha_key = str(data["haKey"]).strip()
-        nl_id = str(data["nlId"]).strip()
-        nl_key = str(data["nlKey"]).strip()
-
-        print(f"\nLooking up HA: {ha_id}  |  NL: {nl_id}")
-
-        result = run_lookup(ha_id, ha_key, nl_id, nl_key)
+        result = run_lookup(siad_id, query_key)
         return jsonify(result), 200
 
     except Exception as e:
@@ -143,6 +162,6 @@ def lookup_both_endpoint():
 
 
 if __name__ == "__main__":
-    print(f"SIAD Lookup Service (v2) — Port {PORT}")
+    print(f"SIAD Lookup Service — Port {PORT}")
     print(f"Screenshots saved to: {SCREENSHOT_DIR}\n")
     app.run(host="0.0.0.0", port=PORT, debug=False)
